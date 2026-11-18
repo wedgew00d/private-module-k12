@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>PRIVATE MODULE K-12</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@300;500;600&family=Zen+Kaku+Gothic+New:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--cy:#7fe3ff;--am:#ffb070;--ink:#e9eef2;--dim:rgba(233,238,242,.55)}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:#000;overflow:hidden;color:var(--ink);
+  font-family:"Rajdhani","Zen Kaku Gothic New","Hiragino Sans","Yu Gothic UI",sans-serif;
+  -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+#view{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;outline:none}
+
+/* ---- menu ---- */
+#menu{position:fixed;inset:0;display:flex;align-items:flex-start;justify-content:flex-start;
+  padding:0 clamp(24px,8vw,120px);overflow-y:auto;
+  background:linear-gradient(90deg,rgba(3,5,8,.88) 0%,rgba(3,5,8,.62) 38%,rgba(3,5,8,0) 72%);
+  transition:opacity .5s}
+#menu.hide{opacity:0;pointer-events:none}
+.panel{max-width:440px;padding:24px 0;margin:auto 0}
+.tag{font-size:12px;letter-spacing:.42em;color:var(--am);font-weight:500;display:flex;align-items:center;gap:12px}
+.tag::before{content:"";width:28px;height:1px;background:var(--am)}
+h1{font-weight:300;font-size:clamp(30px,min(6.4vw,10vh),68px);line-height:.98;letter-spacing:.14em;margin:18px 0 10px}
+h1 b{font-weight:600;color:var(--cy)}
+.sub{font-family:"Zen Kaku Gothic New",sans-serif;font-size:13px;letter-spacing:.3em;color:var(--dim)}
+.btns{display:flex;flex-direction:column;gap:10px;margin:clamp(16px,4.5vh,34px) 0 clamp(12px,3vh,26px);width:min(300px,100%)}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+.btn{position:relative;text-align:left;padding:13px 18px 12px 22px;font-size:17px;font-weight:500;letter-spacing:.3em;
+  border:1px solid rgba(233,238,242,.22);background:rgba(10,14,18,.45);
+  clip-path:polygon(0 0,calc(100% - 12px) 0,100% 12px,100% 100%,12px 100%,0 calc(100% - 12px));
+  transition:background .2s,border-color .2s,color .2s}
+.btn::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--cy);opacity:.0;transition:opacity .2s}
+.btn small{float:right;font-family:"Zen Kaku Gothic New",sans-serif;font-size:11px;letter-spacing:.2em;color:var(--dim);padding-top:4px}
+.btn:hover,.btn:focus-visible{background:rgba(127,227,255,.1);border-color:var(--cy);outline:none}
+.btn:hover::before,.btn:focus-visible::before{opacity:1}
+.btn.main{border-color:rgba(127,227,255,.55)}
+.vol{display:flex;align-items:center;gap:14px;padding:6px 4px 2px 22px;font-size:15px;font-weight:500;letter-spacing:.3em}
+.vol span{width:46px}
+.vol output{width:46px;text-align:right;font-size:13px;letter-spacing:.1em;color:var(--dim)}
+.vol input{flex:1;min-width:0;height:28px;margin:0;background:none;-webkit-appearance:none;appearance:none;cursor:pointer;touch-action:pan-y}
+.vol input::-webkit-slider-runnable-track{height:2px;background:linear-gradient(90deg,var(--cy) var(--p,60%),rgba(233,238,242,.25) var(--p,60%))}
+.vol input::-moz-range-track{height:2px;background:rgba(233,238,242,.25)}
+.vol input::-moz-range-progress{height:2px;background:var(--cy)}
+.vol input::-webkit-slider-thumb{-webkit-appearance:none;width:10px;height:18px;margin-top:-8px;background:var(--cy);border:0;border-radius:0}
+.vol input::-moz-range-thumb{width:10px;height:18px;background:var(--cy);border:0;border-radius:0}
+.vol input:focus-visible{outline:1px solid var(--cy);outline-offset:4px}
+.help{font-family:"Zen Kaku Gothic New",sans-serif;font-size:12px;line-height:2;color:var(--dim);letter-spacing:.08em}
+.help kbd{font-family:"Rajdhani",sans-serif;font-weight:600;font-size:12px;letter-spacing:.1em;color:var(--ink);
+  border:1px solid rgba(233,238,242,.3);padding:1px 6px;margin-right:4px}
+.only-touch{display:none}
+@media (pointer:coarse){.only-touch{display:block}.only-mouse{display:none}}
+
+/* ---- hud ---- */
+#hud{position:fixed;inset:0;pointer-events:none;opacity:0;transition:opacity .4s}
+#hud.on{opacity:1}
+#dot{position:absolute;left:50%;top:50%;width:4px;height:4px;margin:-2px;border-radius:50%;background:rgba(255,255,255,.55)}
+#prompt{position:absolute;left:50%;top:63%;transform:translateX(-50%);white-space:nowrap;
+  font-family:"Zen Kaku Gothic New",sans-serif;font-size:13px;letter-spacing:.18em;
+  padding:8px 16px;background:rgba(4,8,11,.6);border-left:2px solid var(--cy);opacity:0;transition:opacity .2s}
+#prompt.on{opacity:1}
+#prompt kbd{font-family:"Rajdhani",sans-serif;font-weight:600;color:var(--cy);margin-right:10px;letter-spacing:.1em}
+#toast{position:absolute;left:50%;top:9%;transform:translateX(-50%);white-space:nowrap;
+  font-size:14px;font-weight:500;letter-spacing:.4em;color:var(--am);opacity:0;transition:opacity .4s}
+#toast.on{opacity:1}
+#pauseBtn{position:absolute;right:14px;top:14px;width:42px;height:42px;pointer-events:auto;
+  border:1px solid rgba(233,238,242,.25);background:rgba(4,8,11,.4);font-size:13px;letter-spacing:.1em}
+#actBtn{position:absolute;right:26px;bottom:110px;width:76px;height:76px;border-radius:50%;pointer-events:auto;
+  border:1px solid var(--cy);background:rgba(127,227,255,.12);font-size:15px;font-weight:600;letter-spacing:.2em;color:var(--cy);display:none}
+#actBtn.on{display:block}
+#stick{position:absolute;width:112px;height:112px;margin:-56px;border-radius:50%;border:1px solid rgba(233,238,242,.3);display:none}
+#stick i{position:absolute;left:50%;top:50%;width:44px;height:44px;margin:-22px;border-radius:50%;background:rgba(233,238,242,.28)}
+#dbg{position:absolute;left:10px;bottom:8px;font-size:12px;letter-spacing:.08em;color:var(--cy);white-space:pre}
+@media (max-width:640px){
+  #menu{background:linear-gradient(180deg,rgba(3,5,8,.82),rgba(3,5,8,.5));justify-content:center}
+  #prompt{top:16%}
+}
+</style>
+<script type="importmap">
+{"imports":{"three":"./lib/three.module.min.js","three/addons/":"./lib/addons/"}}
+</script>
+</head>
+<body>
+<canvas id="view" tabindex="0"></canvas>
+
+<div id="hud">
+  <div id="dot"></div>
+  <div id="prompt"></div>
+  <div id="toast"></div>
+  <button id="pauseBtn" aria-label="メニュー">II</button>
+  <button id="actBtn">ACT</button>
+  <div id="stick"><i></i></div>
+  <div id="dbg"></div>
+</div>
+
+<div id="menu">
+  <div class="panel">
+    <div class="tag">HABITAT RING / SECTOR 07</div>
+    <h1>PRIVATE<br>MODULE <b>K-12</b></h1>
+    <div class="sub">個室区画 ― 主観視点プロトタイプ</div>
+    <div class="btns">
+      <button class="btn main" id="startBtn">ENTER<small id="startSub">入室する</small></button>
+      <button class="btn" id="qualBtn">QUALITY<small id="qualSub">高</small></button>
+      <button class="btn" id="sndBtn">SOUND<small id="sndSub">入</small></button>
+      <label class="vol"><span>BGM</span><input type="range" id="bgmVol" min="0" max="100" step="5" aria-label="BGMの音量"><output id="bgmVal"></output></label>
+      <label class="vol"><span>SE</span><input type="range" id="seVol" min="0" max="100" step="5" aria-label="効果音の音量"><output id="seVal"></output></label>
+    </div>
+    <div class="help only-mouse">
+      <div><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>移動　<kbd>SHIFT</kbd>早歩き</div>
+      <div><kbd>MOUSE</kbd>視点　<kbd>E</kbd>操作　<kbd>ESC</kbd>メニュー</div>
+      <div>音が出ます（ENTER で開始）</div>
+    </div>
+    <div class="help only-touch">
+      <div>画面の左半分をドラッグ：移動</div>
+      <div>画面の右半分をドラッグ：視点　／　ACT：操作</div>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="./js/game.js"></script>
+</body>
+</html>
