@@ -6,11 +6,14 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
+import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
+import { FXAAShader } from 'three/addons/shaders/FXAAShader.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { createAudio } from './audio.js';
 const audio = createAudio();
 
-const DEBUG = location.hash === '#debug';
+let DEBUG = location.hash === '#debug';
 const COARSE = matchMedia('(pointer:coarse)').matches;
 const $ = id => document.getElementById(id);
 const canvas = $('view');
@@ -24,6 +27,7 @@ renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.shadowMap.autoUpdate = false;
+renderer.info.autoReset = false;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x000000);
@@ -59,11 +63,17 @@ const texBrushed = canvasTex(256, 256, (g, w, h) => {
   for (let y = 0; y < h; y++) { const row = 165 + rnd() * 50; for (let x = 0; x < w; x++) { const v = row + rnd() * 34; const i = (y * w + x) * 4; id.data[i] = id.data[i + 1] = id.data[i + 2] = v; id.data[i + 3] = 255; } }
   g.putImageData(id, 0, 0);
 }, { srgb: false, repeat: [1, 3] });
-const texWeave = canvasTex(128, 128, (g, w, h) => {
-  const id = g.createImageData(w, h);
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const v = 128 + ((x + y) % 4 < 2 ? 40 : -40) * ((x - y + 400) % 4 < 2 ? 1 : .4) + rnd() * 50 - 25; const i = (y * w + x) * 4; id.data[i] = id.data[i + 1] = id.data[i + 2] = v; id.data[i + 3] = 255; }
+// 布の凹凸。規則的な織り目（斜めの格子）にすると、離れて見たときに細かい斜めの縞（モアレ）が出るので、
+// 向きのない細かいむらにする。2px と 5px の粒を重ねる。
+const texWeave = canvasTex(256, 256, (g, w, h) => {
+  const id = g.createImageData(w, h), a = new Float32Array(w * h);
+  const layer = (cell, amp) => { const n = w / cell, v = new Float32Array(n * n); for (let i = 0; i < v.length; i++) v[i] = rnd() - .5;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const fx = x / cell, fy = y / cell, x0 = Math.floor(fx), y0 = Math.floor(fy), tx = fx - x0, ty = fy - y0, x1 = (x0 + 1) % n, y1 = (y0 + 1) % n;
+      a[y * w + x] += amp * ((v[y0 * n + x0] * (1 - tx) + v[y0 * n + x1] * tx) * (1 - ty) + (v[y1 * n + x0] * (1 - tx) + v[y1 * n + x1] * tx) * ty); } };
+  layer(2, 150); layer(4, 90); layer(16, 50);
+  for (let i = 0; i < a.length; i++) { const v = clamp(128 + a[i], 0, 255); id.data[i * 4] = id.data[i * 4 + 1] = id.data[i * 4 + 2] = v; id.data[i * 4 + 3] = 255; }
   g.putImageData(id, 0, 0);
-}, { srgb: false, repeat: [10, 10] });
+}, { srgb: false, repeat: [8, 8] });
 // 床：1m角のスラブ、継ぎ目、拭き跡（粗さのむら）
 const floorCol = canvasTex(1024, 1024, (g, w, h) => {
   g.fillStyle = '#2b2e34'; g.fillRect(0, 0, w, h);
@@ -85,6 +95,27 @@ const floorRough = canvasTex(1024, 1024, (g, w, h) => {
   for (let i = 0; i <= 4; i++) { g.beginPath(); g.moveTo(i * 256, 0); g.lineTo(i * 256, h); g.moveTo(0, i * 256); g.lineTo(w, i * 256); g.stroke(); }
 }, { srgb: false });
 
+// 置き影（接地の暗がり）：丸、角丸の四角、壁際の帯
+function shadowTex(kind) {
+  return canvasTex(128, 128, (c, w, h) => {
+    const id = c.createImageData(w, h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const u = x / (w - 1) * 2 - 1, v = y / (h - 1) * 2 - 1; let a;
+      if (kind === 'round') a = 1 - Math.hypot(u, v);
+      else if (kind === 'rect') { const qx = Math.max(Math.abs(u) - .5, 0), qy = Math.max(Math.abs(v) - .5, 0); a = 1 - Math.hypot(qx, qy) / .5; }
+      else a = (1 - (v + 1) / 2);
+      a = clamp(a, 0, 1); a = a * a * (3 - 2 * a); id.data[(y * w + x) * 4 + 3] = a * 255;
+    }
+    c.putImageData(id, 0, 0);
+  });
+}
+const shTex = { round: shadowTex('round'), rect: shadowTex('rect'), edge: shadowTex('edge') }, shMats = [];
+function blob(parent, kind, x, y, z, w, d, op, ry = 0) {
+  const mat = new THREE.MeshBasicMaterial({ map: shTex[kind], color: 0x000000, transparent: true, opacity: op, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+  mat.userData.op = op; shMats.push(mat);
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, d).rotateX(-Math.PI / 2), mat); m.position.set(x, y, z); m.rotation.y = ry; m.renderOrder = 2; parent.add(m); return m;
+}
+
 // ---------------------------------------------------------------- materials
 const Std = o => new THREE.MeshStandardMaterial(o);
 const Basic = o => new THREE.MeshBasicMaterial(o);
@@ -102,7 +133,7 @@ const M = {
   fabricLight: Std({ color: 0xa39e95, roughness: .9, metalness: 0, bumpMap: texWeave, bumpScale: .8 }),
   white: Std({ color: 0xdad6ce, roughness: .55, metalness: 0 }),
   cushion: Std({ color: 0xb4572b, roughness: .9, metalness: 0, bumpMap: texWeave, bumpScale: 1 }),
-  rug: Std({ color: 0x1b1a1b, roughness: 1, metalness: 0, bumpMap: texWeave, bumpScale: 1.5 }),
+  rug: Std({ color: 0x1b1a1b, roughness: 1, metalness: 0, bumpMap: texWeave, bumpScale: .9 }),
   strip: Basic({ color: 0xffffff, side: THREE.DoubleSide }),   // 壁の間接照明（モードで変わる）
   ring: Basic({ color: 0xffffff, side: THREE.DoubleSide }),    // 天井リング（モードで変わる）
   accent: Basic({ color: new THREE.Color(.28, .95, 1.15).multiplyScalar(2.0), side: THREE.DoubleSide }),
@@ -112,8 +143,8 @@ const M = {
   black: Basic({ color: 0x010203 }),
   plate: Basic({ color: 0x0b0c0e }),
   // ガラスは映りこみだけを加算で重ねる（点光源の鋭いハイライトを拾わないよう、環境マップのみ）
-  glass: Basic({ color: 0x000000, reflectivity: .2, combine: THREE.AddOperation, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }),
-  glassDS: Basic({ color: 0x000000, reflectivity: .16, combine: THREE.AddOperation, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }),
+  glass: Basic({ color: 0x000000, reflectivity: .13, combine: THREE.AddOperation, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }),
+  glassDS: Basic({ color: 0x000000, reflectivity: .11, combine: THREE.AddOperation, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }),
 };
 const floorMat = Std({ map: floorCol, roughnessMap: floorRough, roughness: 1, metalness: .55, color: 0xffffff });
 
@@ -166,7 +197,9 @@ function buildShell() {
   // 天井
   const ceil = new THREE.Mesh(new THREE.CircleGeometry(RC + .2, 48).rotateX(Math.PI / 2), M.wall); ceil.position.y = H; scene.add(ceil);
   const soffit = new THREE.Mesh(new THREE.RingGeometry(3.55, RC + .2, 64).rotateX(Math.PI / 2), M.panel); soffit.position.y = 2.72; soffit.castShadow = true; scene.add(soffit);
-  mesh(new THREE.CylinderGeometry(3.55, 3.55, .28, 64, 1, true), M.wallIn, scene, 0, 2.86, 0, false);
+  { // 立ち上がり面は内向きに作る（面の順と法線の両方を裏返す）。裏面描画のままだと、AO の法線・深度の撮影に写らない
+    const bg = new THREE.CylinderGeometry(3.55, 3.55, .28, 64, 1, true).scale(-1, 1, 1); const nn = bg.attributes.normal; for (let i = 0; i < nn.count; i++) nn.setXYZ(i, -nn.getX(i), -nn.getY(i), -nn.getZ(i));
+    mesh(bg, M.wall, scene, 0, 2.86, 0, false); }
   mesh(new THREE.CylinderGeometry(3.546, 3.546, .03, 64, 1, true), M.strip, scene, 0, 2.79, 0);
   // 吊り天板とリング照明
   cyl(scene, 1.62, 1.62, .05, 0, 2.94, 0, M.plate, 64, false);
@@ -215,9 +248,10 @@ function buildWindowSide(i) {
   box(g, W - .5, .03, .02, 0, .2, .225, M.strip);
   box(g, W - .36, .008, .016, 0, .864, .19, M.accentDim);
   box(g, W + .04, .32, .14, 0, 2.86, -.05, M.wall);
-  const gl = new THREE.Mesh(new THREE.PlaneGeometry(W, 1.9), M.glass); gl.position.set(0, 1.8, -.03); g.add(gl);
+  const gl = new THREE.Mesh(new THREE.PlaneGeometry(W, 1.9), M.glass); gl.position.set(0, 1.8, -.03); g.add(gl); glassMeshes.push(gl);
   return g;
 }
+const glassMeshes = [];
 const skyMat = new THREE.ShaderMaterial({
   side: THREE.BackSide, depthWrite: false,
   uniforms: { time: { value: 0 }, sunDir: { value: new THREE.Vector3(.8, .5, -.22).normalize() } },
@@ -232,7 +266,7 @@ const skyMat = new THREE.ShaderMaterial({
     void main(){
       vec3 ro=vec3(0.,1.6,0.); vec3 d=normalize(vW-ro); vec3 col=vec3(0.);
       vec3 g=d*150.; vec3 id=floor(g); vec3 f=fract(g)-.5; float h=hash(id);
-      float star=step(.982,h)*smoothstep(.38,.0,length(f))*(.4+2.8*fract(h*91.7));
+      float star=step(.982,h)*(1.-smoothstep(.0,.38,length(f)))*(.4+2.8*fract(h*91.7));
       col+=star*mix(vec3(.7,.82,1.),vec3(1.,.85,.7),fract(h*37.));
       col+=vec3(.05,.03,.09)*pow(fbm(d*3.+2.),3.)*1.6;
       vec3 pc=vec3(15.,-60.,80.); float pr=70.;
@@ -250,7 +284,7 @@ const skyMat = new THREE.ShaderMaterial({
         col+=vec3(1.,.62,.28)*city*.8;
         float rim=pow(1.-max(dot(n,-d),0.),3.2);
         col+=vec3(.22,.5,1.)*rim*(.12+day)*1.5;
-        col+=vec3(1.,.45,.2)*rim*smoothstep(.25,.0,abs(ndl))*.5;
+        col+=vec3(1.,.45,.2)*rim*(1.-smoothstep(.0,.25,abs(ndl)))*.5;
       } else if(b<0.){
         float hh=closest-pr; vec3 pn=normalize(ro+d*(-b)-pc);
         float day=smoothstep(-.3,.3,dot(pn,sunDir));
@@ -445,11 +479,11 @@ function drawTerminal(t) {
 }
 
 // ---------------------------------------------------------------- shower pod
-const pod = { pos: new THREE.Vector3(), on: false, power: 0, mat: null, light: null };
+const pod = { pos: new THREE.Vector3(), on: false, power: 0, fog: 0, mat: null, light: null, steam: null, fogMat: null };
 function buildPod() {
   const a = 300 * Math.PI / 180, g = new THREE.Group(); g.position.set(Math.cos(a) * 3.4, 0, Math.sin(a) * 3.4); scene.add(g); g.updateMatrixWorld(true);
   cyl(g, .68, .7, .12, 0, .06, 0, M.panel2, 48); cyl(g, .7, .68, .2, 0, 2.36, 0, M.panel2, 48);
-  mesh(new THREE.CylinderGeometry(.62, .62, 2.12, 48, 1, true), M.glassDS, g, 0, 1.2, 0);
+  glassMeshes.push(mesh(new THREE.CylinderGeometry(.62, .62, 2.12, 48, 1, true), M.glassDS, g, 0, 1.2, 0));
   const frost = canvasTex(16, 256, (c, w, h) => { const gr = c.createLinearGradient(0, 0, 0, h); gr.addColorStop(0, 'rgba(160,220,235,0)'); gr.addColorStop(.3, 'rgba(160,220,235,.5)'); gr.addColorStop(.7, 'rgba(160,220,235,.5)'); gr.addColorStop(1, 'rgba(160,220,235,0)'); c.fillStyle = gr; c.fillRect(0, 0, w, h); });
   mesh(new THREE.CylinderGeometry(.615, .615, 1.2, 48, 1, true), Basic({ map: frost, transparent: true, opacity: .16, depthWrite: false, side: THREE.DoubleSide }), g, 0, 1.15, 0);
   mesh(new THREE.TorusGeometry(.63, .012, 8, 64).rotateX(Math.PI / 2), M.accent, g, 0, .135, 0); mesh(new THREE.TorusGeometry(.63, .012, 8, 64).rotateX(Math.PI / 2), M.accent, g, 0, 2.25, 0);
@@ -468,8 +502,28 @@ function buildPod() {
       void main(){ vec3 p=position; float f=fract(sd*7.31+time*(1.25+sd*.5)); p.y=2.02-f*f*1.88; p.xz*=1.+f*.12;
         vec4 mv=modelViewMatrix*vec4(p,1.); gl_Position=projectionMatrix*mv;
         float px=.011*projectionMatrix[1][1]*vh*.5/max(-mv.z,.05); float k=min(px/1.2,1.); gl_PointSize=max(px,1.2); vA=power*k*k*(.35+.65*step(sd,power))*step(sd,power*1.2); }`,
-    fragmentShader: `varying float vA; void main(){ vec2 c=gl_PointCoord-.5; float d=length(c*vec2(2.4,1.)); gl_FragColor=vec4(vec3(.55,.9,1.)*1.3*vA*smoothstep(.5,.1,d),1.); }` });
+    fragmentShader: `varying float vA; void main(){ vec2 c=gl_PointCoord-.5; float d=length(c*vec2(2.4,1.)); gl_FragColor=vec4(vec3(.55,.9,1.)*1.3*vA*(1.-smoothstep(.1,.5,d)),1.); }` });
   const w = new THREE.Points(wg, pod.mat); w.frustumCulled = false; g.add(w);
+  // 湯気（シャワー中だけ。やわらかい粒がゆっくり上る）
+  const sn = 90, sp = new Float32Array(sn * 3), ss = new Float32Array(sn); for (let i = 0; i < sn; i++) ss[i] = rnd();
+  const sg = new THREE.BufferGeometry(); sg.setAttribute('position', new THREE.BufferAttribute(sp, 3)); sg.setAttribute('sd', new THREE.BufferAttribute(ss, 1));
+  pod.steam = new THREE.ShaderMaterial({ transparent: true, depthWrite: false, uniforms: { time: { value: 0 }, power: { value: 0 }, vh: { value: 720 } },
+    vertexShader: `attribute float sd; uniform float time, vh, power; varying float vA;
+      void main(){ float f=fract(sd*3.17+time*(.07+.06*sd)); float a=sd*41.+time*.25*(sd-.5)+f*2.; float r=.08+.36*fract(sd*7.7)*(.6+.4*f);
+        vec3 p=vec3(cos(a)*r, .35+f*1.8, sin(a)*r);
+        vec4 mv=modelViewMatrix*vec4(p,1.); gl_Position=projectionMatrix*mv;
+        gl_PointSize=min((.28+.3*f)*projectionMatrix[1][1]*vh*.5/max(-mv.z,.3), vh*.35); vA=power*sin(3.14159*f)*.03; }`,
+    fragmentShader: `varying float vA; void main(){ float d=length(gl_PointCoord-.5); gl_FragColor=vec4(vec3(.42,.6,.68), vA*(1.-smoothstep(.0,.5,d))); }` });
+  const st = new THREE.Points(sg, pod.steam); st.frustumCulled = false; st.renderOrder = 3; g.add(st);
+  // ガラスの曇り（むらのある白。シャワーを止めると、ゆっくり晴れる）
+  const fogT = canvasTex(256, 256, (c, w2, h2) => {
+    for (let i = 0; i < 220; i++) { const x = rnd() * w2, y = rnd() * h2, r = 14 + rnd() * 46, a = .1 + rnd() * .16; for (const ox of [0, w2, -w2]) { const gr = c.createRadialGradient(x + ox, y, 0, x + ox, y, r); gr.addColorStop(0, `rgba(255,255,255,${a})`); gr.addColorStop(1, 'rgba(255,255,255,0)'); c.fillStyle = gr; c.fillRect(x + ox - r, y - r, r * 2, r * 2); } }
+    const gr = c.createLinearGradient(0, 0, 0, h2); gr.addColorStop(0, 'rgba(0,0,0,.75)'); gr.addColorStop(.18, 'rgba(0,0,0,0)'); gr.addColorStop(.9, 'rgba(0,0,0,0)'); gr.addColorStop(1, 'rgba(0,0,0,.6)');
+    c.globalCompositeOperation = 'destination-out'; c.fillStyle = gr; c.fillRect(0, 0, w2, h2);
+    c.strokeStyle = 'rgba(0,0,0,.5)'; c.lineWidth = 2; for (let i = 0; i < 26; i++) { const x = rnd() * w2, y0 = 30 + rnd() * 120; c.beginPath(); c.moveTo(x, y0); c.lineTo(x + (rnd() - .5) * 5, y0 + 30 + rnd() * 90); c.stroke(); }   // 水滴が流れた跡
+  }, { repeat: [3, 1] });
+  pod.fogMat = Basic({ map: fogT, color: new THREE.Color(.3, .44, .5), transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide });
+  mesh(new THREE.CylinderGeometry(.611, .611, 2.08, 48, 1, true), pod.fogMat, g, 0, 1.2, 0).renderOrder = 4;
 }
 
 // ---------------------------------------------------------------- lounge + hologram
@@ -520,12 +574,12 @@ function buildLounge() {
         float sp=time*(.18+.25*w.z); float c=cos(sp), s=sin(sp); p.xz=mat2(c,-s,s,c)*p.xz;
         float mix01=1.-max(max(w.x,w.y),w.z); p+= (vec3(fract(sd*13.1),fract(sd*71.7),fract(sd*29.3))-.5)*mix01*.5;
         p.y+=sin(time*1.4+p.x*16.+sd*6.)*.004;
-        float scan=smoothstep(.04,.0,abs(p.y-(fract(time*.12)*1.-.5)));
+        float scan=(1.-smoothstep(.0,.04,abs(p.y-(fract(time*.12)*1.-.5))));
         vec4 mv=modelViewMatrix*vec4(p,1.); gl_Position=projectionMatrix*mv;
         float px=.0065*(.6+sd*.9)*projectionMatrix[1][1]*vh*.5/max(-mv.z,.05);
         float k=min(px/1.3,1.); gl_PointSize=max(px,1.3);
         vC=mix(vec3(.18,.75,1.),vec3(1.,.72,.4),smoothstep(.0,.25,p.y)*w.y+step(.93,sd))*(.75+scan*1.8)*k*k*power*1.5; }`,
-    fragmentShader: `varying vec3 vC; void main(){ float d=length(gl_PointCoord-.5); gl_FragColor=vec4(vC*smoothstep(.5,.15,d),1.); }`
+    fragmentShader: `varying vec3 vC; void main(){ float d=length(gl_PointCoord-.5); gl_FragColor=vec4(vC*(1.-smoothstep(.15,.5,d)),1.); }`
   });
   holo.group = new THREE.Group(); holo.group.position.set(0, 1.22, 0); scene.add(holo.group);
   const pts = new THREE.Points(hg, holo.mat); pts.frustumCulled = false; holo.group.add(pts);
@@ -534,6 +588,46 @@ function buildLounge() {
   holo.beam.position.set(0, .84, 0); scene.add(holo.beam);
   holo.light = new THREE.PointLight(0x7fe3ff, 2.2, 4, 2); holo.light.position.set(0, 1.1, 0); scene.add(holo.light);
 }
+
+// ---------------------------------------------------------------- 窓からの光の筋（疑似ボリューム）
+// 窓の開口を、外の光源から見た向きへ掃いた薄い面を重ねる。加算で、追加の描画パスはない。
+const shaftMat = new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+  uniforms: { time: { value: 0 }, amp: { value: 0 } },
+  vertexShader: `attribute float kind; varying vec2 vUv; varying float vK; varying vec3 vW; void main(){ vUv=uv; vK=kind; vec4 w=modelMatrix*vec4(position,1.); vW=w.xyz; gl_Position=projectionMatrix*viewMatrix*w; }`,
+  fragmentShader: `uniform float time, amp; varying vec2 vUv; varying float vK; varying vec3 vW;
+    float h(float x){ return fract(sin(x*91.345)*4758.5453); }
+    float n1(float x){ float i=floor(x), f=fract(x); f=f*f*(3.-2.*f); return mix(h(i),h(i+1.),f); }
+    void main(){ float e=smoothstep(0.,.14,vUv.x)*(1.-smoothstep(.86,1.,vUv.x));
+      float len=pow(1.-vUv.y,1.5)*smoothstep(0.,.05,vUv.y);
+      float st=.6+.4*n1(vUv.x*7.+vK*17.+time*.05)*n1(vUv.x*17.-time*.03+vK*5.);
+      // 面を真横から見ると線に見えるので、視線と面のなす角で薄くする。近すぎる面も薄くする
+      // 正規化はしない：面が退化している画素や、視点が面の上にあるとき、0 で割って不正な値（NaN）になり、
+      // それがブルームと横筋で広がって、1フレームだけ大きな黒い四角になった
+      vec3 cr=cross(dFdx(vW),dFdy(vW)); vec3 v=cameraPosition-vW; float dist=length(v);
+      float fa=abs(dot(cr,v))/max(length(cr)*dist,1e-9);
+      float face=smoothstep(.06,.5,fa)*smoothstep(.25,1.2,dist);
+      gl_FragColor=vec4(clamp(vec3(.5,.72,1.)*e*len*st*face*amp,0.,4.),1.); }`
+});
+let shafts = null, shaftOn = true;
+function buildShafts() {
+  const L = winLight.position, pos = [], uv = [], kind = [], idx = []; let nv = 0, k = 0;
+  const quad = (a, b) => {   // a, b：窓の面の上の2点。光源から遠ざかる向きへ、床まで（最長 6.5m）掃く
+    const pts = [a, b].map(p => { const d = p.clone().sub(L).normalize(); const t = Math.min(d.y < -1e-3 ? (p.y - .02) / -d.y : 6.5, 6.5); return p.clone().addScaledVector(d, t); });
+    for (const [p, u, v] of [[a, 0, 0], [b, 1, 0], [pts[1], 1, 1], [pts[0], 0, 1]]) { pos.push(p.x, p.y, p.z); uv.push(u, v); kind.push(k); }
+    idx.push(nv, nv + 1, nv + 2, nv, nv + 2, nv + 3); nv += 4; k++;
+  };
+  for (const i of [SIDE.WIN_A, SIDE.WIN_B, SIDE.WIN_C]) {
+    const g = sideGroup(i), hw = W / 2 - .17, y0 = .9, y1 = 2.68;
+    for (let j = 0; j < 12; j++) { const y = y0 + (j + .5) / 12 * (y1 - y0); quad(worldOf(g, -hw, y, .02), worldOf(g, hw, y, .02)); }
+    for (let j = 0; j < 9; j++) { const x = -hw + (j + .5) / 9 * hw * 2; quad(worldOf(g, x, y1, .02), worldOf(g, x, y0, .02)); }
+  }
+  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2)); geo.setAttribute('kind', new THREE.Float32BufferAttribute(kind, 1)); geo.setIndex(idx);
+  shafts = new THREE.Mesh(geo, shaftMat); shafts.frustumCulled = false; shafts.renderOrder = 5; scene.add(shafts);
+}
+
+const poisonMesh = new THREE.Mesh(new THREE.PlaneGeometry(.02, .02), new THREE.ShaderMaterial({ uniforms: { z: { value: 0 } }, vertexShader: `void main(){ gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`, fragmentShader: `uniform float z; void main(){ gl_FragColor=vec4(vec3(z/z),1.); }`, side: THREE.DoubleSide, depthTest: false }));
+poisonMesh.visible = false; poisonMesh.position.set(0, 1.6, -1.2); poisonMesh.renderOrder = 9; scene.add(poisonMesh);
 
 // ---------------------------------------------------------------- dust
 let dust;
@@ -546,28 +640,52 @@ function buildDust() {
   scene.add(dust);
 }
 
+// ---------------------------------------------------------------- 置き影の配置
+function buildBlobs() {
+  // K-12 は壁際・寝台の下・前室の壁際に足元の間接光があるので、そこには置かない（光っている場所を暗くしてしまう）。
+  // 置くのは、足元に光のない家具だけ。
+  const tg = sideGroup(SIDE.TERM); blob(tg, 'rect', 0, .005, .42, 2.2, 1.15, .6); blob(tg, 'round', 0, .005, 1.1, .62, .62, .7);
+  blob(scene, 'round', pod.pos.x, .005, pod.pos.z, 1.9, 1.9, .45);
+  for (let k = 0; k < 5; k++) { const a = (222 + k * 24) * Math.PI / 180; blob(scene, 'rect', Math.cos(a) * 1.68, .013, Math.sin(a) * 1.68, 1.02, 1.12, .75, Math.atan2(-Math.cos(a), -Math.sin(a))); }
+  blob(scene, 'round', 0, .013, 0, 1.5, 1.5, .7);
+  blob(scene, 'round', .33, .4312, -.2, .15, .15, .6); blob(scene, 'rect', -.3, .4312, .22, .3, .22, .5, .5);
+}
+
 // ---------------------------------------------------------------- lights + moods
+// hI：半球光、win：窓の外の光、shaft：光の筋。g*：グレーディング（影の色、光の色、彩度、S字、暗部の持ち上げ）
 const MOODS = [
-  { name: 'AMBER', jp: 'アンバー', strip: [1, .5, .2], sI: 2.5, ring: [1, .8, .58], rI: 2.8, key: [1, .82, .64], kI: 30, bed: 5, exp: 1.0 },
-  { name: 'GLACIER', jp: 'グレイシャー', strip: [.42, .74, 1], sI: 2.4, ring: [.84, .93, 1], rI: 3.0, key: [.8, .9, 1], kI: 32, bed: 3, exp: 1.0 },
-  { name: 'NIGHT', jp: 'ナイト', strip: [1, .22, .07], sI: .9, ring: [1, .42, .2], rI: .22, key: [1, .55, .32], kI: 1.6, bed: 1.2, exp: 1.25 },
+  { name: 'AMBER', jp: 'アンバー', strip: [1, .5, .2], sI: 2.5, ring: [1, .8, .58], rI: 2.8, key: [1, .82, .64], kI: 30, bed: 5, exp: 1.0, hI: .25, win: 60, shaft: .3,
+    gSh: [.90, .95, 1.12], gHi: [1.06, 1.0, .90], gSat: 1.06, gS: .12, gLift: 0 },
+  { name: 'GLACIER', jp: 'グレイシャー', strip: [.42, .74, 1], sI: 2.4, ring: [.84, .93, 1], rI: 3.0, key: [.8, .9, 1], kI: 32, bed: 3, exp: 1.0, hI: .25, win: 60, shaft: .45,
+    gSh: [.86, .95, 1.14], gHi: [1.02, 1.0, .985], gSat: .94, gS: .17, gLift: 0 },
+  { name: 'NIGHT', jp: 'ナイト', strip: [1, .22, .07], sI: .9, ring: [1, .42, .2], rI: .22, key: [1, .55, .32], kI: 1.6, bed: 1.2, exp: 1.25, hI: .25, win: 150, shaft: 1,
+    gSh: [.95, .94, 1.16], gHi: [1.07, 1.0, .92], gSat: 1.0, gS: .06, gLift: .012 },
 ];
+const MOOD_NUM = ['sI', 'rI', 'kI', 'bed', 'exp', 'hI', 'win', 'shaft', 'gSat', 'gS', 'gLift'], MOOD_VEC = ['strip', 'ring', 'key', 'gSh', 'gHi'];
 const mood = { target: 0, cur: JSON.parse(JSON.stringify(MOODS[0])), t: 1, envTimer: 0 };
-let keyLight, hemi, winLight;
+let keyLight, hemi, winLight, gradeOn = true;
 function buildLights() {
   hemi = new THREE.HemisphereLight(0x8a94a8, 0x1a1410, .25); scene.add(hemi);
   keyLight = new THREE.PointLight(0xffffff, 30, 14, 2); keyLight.position.set(0, 2.78, 0);
   keyLight.castShadow = true; keyLight.shadow.mapSize.set(1024, 1024); keyLight.shadow.bias = -.003; keyLight.shadow.normalBias = .03; keyLight.shadow.radius = 4;
   keyLight.shadow.camera.near = .1; keyLight.shadow.camera.far = 12; scene.add(keyLight);
   winLight = new THREE.SpotLight(0x86b4ff, 60, 16, .75, 1, 2); winLight.position.set(1.5, 3.4, 7.2); winLight.target.position.set(-.3, .2, 0); scene.add(winLight, winLight.target);
+  // 窓の外光の影（標準と高）。窓枠・腰壁・家具の影が床に伸びる。影は起動時に1回だけ計算する。
+  winLight.shadow.mapSize.set(1024, 1024); winLight.shadow.bias = -.0012; winLight.shadow.normalBias = .02; winLight.shadow.radius = 3; winLight.shadow.camera.near = 1; winLight.shadow.camera.far = 16;
 }
+function applyGrade() {
+  if (!finalPass) return; const c = mood.cur, u = finalPass.uniforms;
+  u.gSh.value.fromArray(c.gSh); u.gHi.value.fromArray(c.gHi); u.gSat.value = c.gSat; u.gS.value = c.gS; u.gLift.value = c.gLift; u.grade.value = gradeOn ? 1 : 0;
+}
+const SHAFT_AMP = .02;
 function applyMood() {
   const c = mood.cur;
   M.strip.color.setRGB(c.strip[0] * c.sI, c.strip[1] * c.sI, c.strip[2] * c.sI);
   M.ring.color.setRGB(c.ring[0] * c.rI, c.ring[1] * c.rI, c.ring[2] * c.rI);
   keyLight.color.setRGB(c.key[0], c.key[1], c.key[2]); keyLight.intensity = c.kI;
   bedLight.intensity = c.bed; bedLight.color.setRGB(c.strip[0] * .6 + .4, c.strip[1] * .6 + .35, c.strip[2] * .6 + .3);
-  renderer.toneMappingExposure = c.exp;
+  hemi.intensity = c.hI; winLight.intensity = winLight.castShadow ? c.win : 60;   // 影なし（軽量）は壁を抜けて届くので、従来の強さのまま shaftMat.uniforms.amp.value = shaftOn ? c.shaft * SHAFT_AMP : 0;
+  renderer.toneMappingExposure = c.exp; applyGrade();
 }
 function setMood(i, instant) {
   mood.target = i; mood.t = instant ? 1 : 0; mood.from = JSON.parse(JSON.stringify(mood.cur));
@@ -576,8 +694,8 @@ function setMood(i, instant) {
 function updateMood(dt) {
   if (mood.t >= 1) return;
   mood.t = Math.min(1, mood.t + dt / 1.4); const k = mood.t * mood.t * (3 - 2 * mood.t), a = mood.from, b = MOODS[mood.target], c = mood.cur;
-  for (const key of ['sI', 'rI', 'kI', 'bed', 'exp']) c[key] = lerp(a[key], b[key], k);
-  for (const key of ['strip', 'ring', 'key']) for (let j = 0; j < 3; j++) c[key][j] = lerp(a[key][j], b[key][j], k);
+  for (const key of MOOD_NUM) c[key] = lerp(a[key], b[key], k);
+  for (const key of MOOD_VEC) for (let j = 0; j < 3; j++) c[key][j] = lerp(a[key][j], b[key][j], k);
   applyMood();
   mood.envTimer += dt; if (mood.envTimer > .22 || mood.t >= 1) { mood.envTimer = 0; captureEnv(); if (mood.t >= 1) captureEnv(); }
 }
@@ -588,41 +706,177 @@ const cubeCam = new THREE.CubeCamera(.1, 200, cubeRT); cubeCam.position.set(0, 1
 const pmrem = new THREE.PMREMGenerator(renderer);
 let envRT = null;
 function captureEnv() {
-  holo.group.visible = false; holo.beam.visible = false; dust.visible = false; pod.mat.uniforms.power.value = 0;
+  // ガラスは、いま書きこむキューブマップ自身を読むので、撮る間は必ず隠す
+  const hide = [holo.group, holo.beam, dust, shafts, ...glassMeshes].filter(Boolean), vis = hide.map(o => o.visible);
+  for (const o of hide) o.visible = false; const pw = pod.mat.uniforms.power.value, sw = pod.steam.uniforms.power.value; pod.mat.uniforms.power.value = 0; pod.steam.uniforms.power.value = 0;
   const exp = renderer.toneMappingExposure; cubeCam.update(renderer, scene); renderer.toneMappingExposure = exp;
-  holo.group.visible = true; holo.beam.visible = holo.power > .02; dust.visible = true;
+  hide.forEach((o, i) => o.visible = vis[i]); pod.mat.uniforms.power.value = pw; pod.steam.uniforms.power.value = sw;
   const rt = pmrem.fromCubemap(cubeRT.texture); scene.environment = rt.texture;
-  for (const m of [M.glass, M.glassDS]) { if (!m.envMap) m.needsUpdate = true; m.envMap = rt.texture; }
   if (envRT) envRT.dispose(); envRT = rt;
 }
 
+// 映りこみの補正：部屋の中央で撮った環境マップを、部屋の形に当たった位置で引き直す。
+// 十二角形の部屋を、半径 4.48m の円柱（内接 4.40 と外接 4.56 の間）と床・天井で近似する。
+// 窓に当たる反射も壁と同じに扱う（外の景色は、窓の面に貼りついた絵として映る）。円柱の外（前室、棚のくぼみ）にある点は補正しない。
+// うまくいかなかった方法：窓に当たる反射だけ補正を外す（無限遠として元の向きで引く）。中央で撮ったマップをその向きで引くと、
+// 窓ではなく天井のリングや壁の帯に当たることがあり、床や卓に、窓の形の明るい四角が出たり消えたりした。
+const BOX_GLSL = `vec3 boxProject( vec3 dir, vec3 wp ) {
+  const float R = 4.48; const float H = ${H.toFixed(2)}; const vec3 probe = vec3( ${cubeCam.position.x.toFixed(2)}, ${cubeCam.position.y.toFixed(2)}, ${cubeCam.position.z.toFixed(2)} );
+  if ( dot( wp.xz, wp.xz ) > ( R + 0.12 ) * ( R + 0.12 ) || wp.y < -0.1 || wp.y > H + 0.1 ) return dir;
+  float a = dot( dir.xz, dir.xz ), b = dot( wp.xz, dir.xz ), c = dot( wp.xz, wp.xz ) - R * R;
+  float tw = a > 1e-6 ? ( - b + sqrt( max( b * b - a * c, 0.0 ) ) ) / a : 1e6;
+  float ty = dir.y > 0.0 ? ( H - wp.y ) / max( dir.y, 1e-5 ) : - wp.y / min( dir.y, - 1e-5 );
+  vec3 hit = wp + dir * max( min( tw, ty ), 0.0 );
+  return normalize( hit - probe );
+}
+`;
+const BOX_CHUNK = THREE.ShaderChunk.envmap_physical_pars_fragment.replace('reflectVec = inverseTransformDirection( reflectVec, viewMatrix );', 'reflectVec = inverseTransformDirection( reflectVec, viewMatrix ); reflectVec = boxProject( reflectVec, vBoxWP );');
+const BOX_OK = BOX_CHUNK !== THREE.ShaderChunk.envmap_physical_pars_fragment;
+const BOXB_CHUNK = THREE.ShaderChunk.envmap_fragment.replace('vec3 reflectVec = vReflect;', 'vec3 reflectVec = boxProject( reflect( normalize( vBoxWP - cameraPosition ), normalize( vBoxN ) ), vBoxWP );');
+const BOXB_OK = BOXB_CHUNK !== THREE.ShaderChunk.envmap_fragment;
+let boxOn = !/nobox/.test(location.hash);
+// 窓の外光（スポット光）からは、鏡面ハイライトを出さない。拡散光だけを受ける。
+// 惑星の光は大きな面の光で、映りこみは環境マップが受け持つ。点としてのハイライトを足すと二重になるうえ、
+// 影で窓の形に切り取られた明るい四角が、歩くたびに床や卓の上に出たり消えたりした。
+const LF = THREE.ShaderChunk.lights_fragment_begin, lfA = LF.indexOf('#if ( NUM_SPOT_LIGHTS > 0 ) && defined( RE_Direct )'), lfB = LF.indexOf('#pragma unroll_loop_end', lfA), lfC = LF.indexOf('#endif', lfB);
+const SPOT_OK = lfA >= 0 && lfB > lfA && lfC > lfB;
+const SPOT_CHUNK = SPOT_OK ? LF.slice(0, lfA) + 'vec3 specBeforeSpot = reflectedLight.directSpecular;\n\t' + LF.slice(lfA, lfC + 6) + '\n\treflectedLight.directSpecular = specBeforeSpot;' + LF.slice(lfC + 6) : LF;
+function boxify(mat) {
+  if (mat.userData.box) return;
+  if (mat.isMeshStandardMaterial && (BOX_OK || SPOT_OK)) {
+    mat.userData.box = true; const box = boxOn && BOX_OK;
+    mat.onBeforeCompile = sh => {
+      if (SPOT_OK) sh.fragmentShader = sh.fragmentShader.replace('#include <lights_fragment_begin>', SPOT_CHUNK);
+      sh.fragmentShader = sh.fragmentShader.replace('#include <dithering_fragment>', '#include <dithering_fragment>\n\tgl_FragColor.rgb = min( max( gl_FragColor.rgb, 0.0 ), vec3( 48.0 ) );');
+      if (!box) return;
+      sh.vertexShader = 'varying vec3 vBoxWP;\n' + sh.vertexShader.replace('#include <project_vertex>', '#include <project_vertex>\n\tvBoxWP = ( modelMatrix * vec4( transformed, 1.0 ) ).xyz;');
+      sh.fragmentShader = 'varying vec3 vBoxWP;\n' + BOX_GLSL + sh.fragmentShader.replace('#include <envmap_physical_pars_fragment>', BOX_CHUNK);
+    };
+    mat.customProgramCacheKey = () => 'k12' + (box ? 'b' : '') + (SPOT_OK ? 's' : '');
+  } else if (mat.isMeshBasicMaterial && mat.envMap && BOXB_OK && boxOn) {
+    mat.userData.box = true;
+    mat.onBeforeCompile = sh => {
+      sh.vertexShader = 'varying vec3 vBoxWP; varying vec3 vBoxN;\n' + sh.vertexShader.replace('#include <project_vertex>', '#include <project_vertex>\n\tvBoxWP = ( modelMatrix * vec4( transformed, 1.0 ) ).xyz; vBoxN = mat3( modelMatrix ) * objectNormal;');
+      sh.fragmentShader = 'varying vec3 vBoxWP; varying vec3 vBoxN;\n' + BOX_GLSL + sh.fragmentShader.replace('#include <envmap_fragment>', BOXB_CHUNK);
+    };
+    mat.customProgramCacheKey = () => 'boxb';
+  }
+}
+
+// ブルームの横筋（アナモルフィック風）。明るい所だけを4分の1の解像度に取り出し、横にだけ2回ぼかして、加算で戻す。
+class StreakPass extends Pass {
+  constructor(w, h) {
+    super(); this.needsSwap = false;
+    this.rtA = new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType, depthBuffer: false }); this.rtB = this.rtA.clone();
+    const vs = `varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`, o = { depthTest: false, depthWrite: false };
+    this.pre = new THREE.ShaderMaterial({ ...o, uniforms: { tDiffuse: { value: null }, px: { value: new THREE.Vector2() } }, vertexShader: vs,
+      fragmentShader: `uniform sampler2D tDiffuse; uniform vec2 px; varying vec2 vUv;
+        vec3 br(vec2 uv){ vec3 c=min(max(texture2D(tDiffuse,uv).rgb,0.),vec3(8.)); float m=max(c.r,max(c.g,c.b)); return c*smoothstep(1.7,3.4,m); }
+        void main(){ gl_FragColor=vec4((br(vUv+px*vec2(-1.,-1.))+br(vUv+px*vec2(1.,-1.))+br(vUv+px*vec2(-1.,1.))+br(vUv+px*vec2(1.,1.)))*.25,1.); }` });
+    this.blur = new THREE.ShaderMaterial({ ...o, uniforms: { tDiffuse: { value: null }, stp: { value: new THREE.Vector2() } }, vertexShader: vs,
+      fragmentShader: `uniform sampler2D tDiffuse; uniform vec2 stp; varying vec2 vUv;
+        void main(){ vec3 s=vec3(0.); float ws=0.; for(int i=-8;i<=8;i++){ float f=float(i), w=exp(-f*f/22.); s+=texture2D(tDiffuse,vUv+stp*f).rgb*w; ws+=w; } gl_FragColor=vec4(s/ws,1.); }` });
+    this.add = new THREE.ShaderMaterial({ ...o, transparent: true, blending: THREE.AdditiveBlending, uniforms: { tDiffuse: { value: null }, strength: { value: .15 } }, vertexShader: vs,
+      fragmentShader: `uniform sampler2D tDiffuse; uniform float strength; varying vec2 vUv; void main(){ vec3 c=texture2D(tDiffuse,vUv).rgb; float l=dot(c,vec3(.33)); gl_FragColor=vec4(mix(vec3(l),c,.7)*vec3(.92,1.,1.12)*strength,1.); }` });
+    this.fsq = new FullScreenQuad(null);
+  }
+  render(renderer, writeBuffer, readBuffer) {
+    const ac = renderer.autoClear; renderer.autoClear = false; const q = this.fsq, w = this.rtA.width;
+    this.pre.uniforms.tDiffuse.value = readBuffer.texture; this.pre.uniforms.px.value.set(1 / readBuffer.width, 1 / readBuffer.height); q.material = this.pre; renderer.setRenderTarget(this.rtA); q.render(renderer);
+    q.material = this.blur; this.blur.uniforms.tDiffuse.value = this.rtA.texture; this.blur.uniforms.stp.value.set(1.5 / w, 0); renderer.setRenderTarget(this.rtB); q.render(renderer);
+    this.blur.uniforms.tDiffuse.value = this.rtB.texture; this.blur.uniforms.stp.value.set(5 / w, 0); renderer.setRenderTarget(this.rtA); q.render(renderer);
+    q.material = this.add; this.add.uniforms.tDiffuse.value = this.rtA.texture; renderer.setRenderTarget(this.renderToScreen ? null : readBuffer); q.render(renderer);
+    renderer.autoClear = ac;
+  }
+  setSize() { }
+  dispose() { this.rtA.dispose(); this.rtB.dispose(); this.pre.dispose(); this.blur.dispose(); this.add.dispose(); this.fsq.dispose(); }
+}
+
 // ---------------------------------------------------------------- post
-let composer, bloom, finalPass, quality = COARSE ? 'low' : 'high';
+let composer, bloom, finalPass, gtao = null, noAO = [], quality = COARSE ? 'low' : 'mid';
 const FinalShader = {
-  uniforms: { tDiffuse: { value: null }, time: { value: 0 }, res: { value: new THREE.Vector2(1, 1) } },
+  uniforms: { tDiffuse: { value: null }, time: { value: 0 }, res: { value: new THREE.Vector2(1, 1) }, grade: { value: 1 }, gSh: { value: new THREE.Vector3(1, 1, 1) }, gHi: { value: new THREE.Vector3(1, 1, 1) }, gSat: { value: 1 }, gS: { value: 0 }, gLift: { value: 0 }, grain: { value: .022 } },
   vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
-  fragmentShader: `uniform sampler2D tDiffuse; uniform float time; uniform vec2 res; varying vec2 vUv;
+  fragmentShader: `uniform sampler2D tDiffuse; uniform float time, grade, gSat, gS, gLift, grain; uniform vec2 res; uniform vec3 gSh, gHi; varying vec2 vUv;
+    // 粒状感の乱数。sin に大きな値を入れる形は、細かい斜めの縞が出るので使わない。
+    float hash12(vec2 p){ vec3 p3=fract(vec3(p.xyx)*.1031); p3+=dot(p3,p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
     void main(){ vec2 c=vUv-.5; float r2=dot(c,c); vec2 off=c*r2*.010;
       vec3 col=vec3(texture2D(tDiffuse,vUv+off).r,texture2D(tDiffuse,vUv).g,texture2D(tDiffuse,vUv-off).b);
       col*=mix(1.,.5,smoothstep(.12,.62,r2));
-      float n=fract(sin(dot(floor(vUv*res)+time*61.,vec2(12.9898,78.233)))*43758.5453);
-      col+=(n-.5)*.022; gl_FragColor=vec4(col,1.); }`
+      // カラーグレーディング（照明モードごと）：軽いS字、影と光の色、暗部の持ち上げ、彩度
+      float l=dot(col,vec3(.2126,.7152,.0722));
+      vec3 g=mix(col,col*col*(3.-2.*col),gS);
+      g*=mix(gSh,gHi,smoothstep(.03,.55,l));
+      g+=gLift*vec3(.5,.55,1.)*(1.-smoothstep(0.,.3,l));
+      float l2=dot(g,vec3(.2126,.7152,.0722)); g=mix(vec3(l2),g,gSat);
+      col=mix(col,g,grade);
+      float f=floor(time*60.); vec2 px=floor(vUv*res)+vec2(mod(f,64.)*17.,mod(f,61.)*29.);
+      col+=(hash12(px)-.5)*grain; gl_FragColor=vec4(max(col,0.),1.); }`
 };
+// 画質ごとの設定。maxPx は描画バッファの画素数の上限、ao は GTAO の解像度の倍率（0 で無効）。
+const QUAL = {
+  low: { jp: '軽量', dpr: 1.25, maxPx: 1.6e6, msaa: 0, fxaa: false, ao: 0, aoSamples: 0, pdSamples: 0, winShadow: false, streak: false },
+  mid: { jp: '標準', dpr: 1.5, maxPx: 2.1e6, msaa: 0, fxaa: true, ao: .5, aoSamples: 8, pdSamples: 8, winShadow: true, streak: true },
+  high: { jp: '高', dpr: 2, maxPx: 2.4e6, msaa: 4, fxaa: false, ao: .5, aoSamples: 8, pdSamples: 8, winShadow: true, streak: true },
+};
+// 自動の解像度調整：fps が足りないとき、描く画素数を段階的に下げる。
+// 作り直した直後は数えない。余裕が続いたら一度だけ1段戻し、足りなければ下げ直して固定する。
+const auto = { scale: 1, acc: 0, n: 0, slow: 0, good: 0, last: 0, grace: 0, triedUp: false, locked: false };
+function autoReset() { auto.scale = 1; auto.slow = auto.good = 0; auto.triedUp = auto.locked = false; }
+function autoScale(now) {
+  const d = now - auto.last; auto.last = now;
+  if (now < auto.grace || d > 250 || d <= 0) { auto.acc = auto.n = 0; return; }
+  auto.acc += d; auto.n++; if (auto.acc < 1000) return;
+  const fps = auto.n * 1000 / auto.acc; auto.acc = auto.n = 0;
+  auto.slow = fps < 50 ? auto.slow + 1 : 0; auto.good = fps >= 58 ? auto.good + 1 : 0;
+  if (auto.slow >= 2 && auto.scale > .5) { if (auto.triedUp) auto.locked = true; auto.scale = Math.max(.5, auto.scale * .85); auto.slow = 0; buildComposer(); }
+  else if (auto.good >= 15 && auto.scale < 1 && !auto.locked) { auto.scale = Math.min(1, auto.scale / .85); auto.triedUp = true; auto.good = 0; buildComposer(); }
+}
+let cfgOver = null, bufSize = new THREE.Vector2(), streak = null, streakOn = true, bloomGuard = false;
 function buildComposer() {
-  const dpr = Math.min(window.devicePixelRatio || 1, quality === 'high' ? 2 : 1.25);
+  const Q = { ...QUAL[quality], ...(cfgOver || {}) }; auto.grace = performance.now() + 2500;
   const w = window.innerWidth, h = window.innerHeight;
+  const dpr = Math.min(window.devicePixelRatio || 1, Q.dpr, Math.sqrt(Q.maxPx / (w * h))) * auto.scale;
   renderer.setPixelRatio(dpr); renderer.setSize(w, h, false);
-  const size = renderer.getDrawingBufferSize(new THREE.Vector2());
-  const rt = new THREE.WebGLRenderTarget(size.x, size.y, { type: THREE.HalfFloatType, samples: quality === 'high' ? 4 : 0 });
+  const size = renderer.getDrawingBufferSize(new THREE.Vector2()); bufSize.copy(size);
+  const rt = new THREE.WebGLRenderTarget(size.x, size.y, { type: THREE.HalfFloatType, samples: Q.msaa });
   if (composer) composer.dispose();
   composer = new EffectComposer(renderer, rt);
   composer.addPass(new RenderPass(scene, camera));
-  bloom = new UnrealBloomPass(new THREE.Vector2(size.x, size.y), quality === 'high' ? .42 : .36, .7, 1.0);
-  composer.addPass(bloom); composer.addPass(new OutputPass());
-  finalPass = new ShaderPass(FinalShader); finalPass.uniforms.res.value.set(size.x, size.y); composer.addPass(finalPass);
+  // アンビエントオクルージョン。半分の解像度で計算する。半透明の物・シェーダで描く物・粒・細い部品は、法線と深度を撮る間だけ隠す。
+  if (gtao) { gtao.dispose(); gtao = null; }
+  if (Q.ao > 0) {
+    const aw = Math.max(2, Math.round(size.x * Q.ao)), ah = Math.max(2, Math.round(size.y * Q.ao));
+    gtao = new GTAOPass(scene, camera, aw, ah, undefined, { radius: .5, distanceExponent: 1.2, thickness: 1.2, scale: 1.7, samples: Q.aoSamples, distanceFallOff: 1, screenSpaceRadius: false }, { lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 5, rings: 2, samples: Q.pdSamples });
+    gtao.blendIntensity = 1;
+    // 合成を差し替える：発光している面（色が1を超える帯、リング、画面）は暗くしない。
+    // 標準の合成は画面全体に掛け算で乗るので、溝に収めた光の帯まで陰になり、ブルームごと暗くなる。
+    gtao.blendMaterial.dispose();
+    gtao.blendMaterial = new THREE.ShaderMaterial({
+      uniforms: { tDiffuse: { value: null }, tColor: { value: null }, intensity: { value: 1 } }, depthTest: false, depthWrite: false,
+      vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+      fragmentShader: `uniform sampler2D tDiffuse, tColor; uniform float intensity; varying vec2 vUv;
+        void main(){ vec4 c=texture2D(tColor,vUv); float ao=texture2D(tDiffuse,vUv).r; float m=max(c.r,max(c.g,c.b));
+          gl_FragColor=vec4(c.rgb*mix(1.,ao,intensity*(1.-smoothstep(.7,1.4,m))),c.a); }` });
+    const run = gtao.render.bind(gtao), setSize = gtao.setSize.bind(gtao);
+    gtao.setSize = () => setSize(aw, ah);     // 合成器が全解像度に戻さないようにする
+    gtao.render = (...a) => { gtao.blendMaterial.uniforms.tColor.value = a[2].texture; for (const o of noAO) { o.userData.v = o.visible; o.visible = false; } run(...a); for (const o of noAO) o.visible = o.userData.v; };
+    composer.addPass(gtao);
+  }
+  for (const m of shMats) m.opacity = m.userData.op * (gtao ? .6 : 1);
+  bloom = new UnrealBloomPass(new THREE.Vector2(size.x, size.y), quality === 'low' ? .36 : .42, .7, 1.0);
+  { const hp = bloom.materialHighPassFilter, a = 'vec4 texel = texture2D( tDiffuse, vUv );'; if (hp.fragmentShader.includes(a)) { hp.fragmentShader = hp.fragmentShader.replace(a, a + ' texel.rgb = min( max( texel.rgb, 0.0 ), vec3( 48.0 ) );'); hp.needsUpdate = true; bloomGuard = true; } }
+  composer.addPass(bloom);
+  if (streak) { streak.dispose(); streak = null; }
+  if (streakOn && Q.streak) { streak = new StreakPass(Math.max(2, size.x >> 2), Math.max(2, size.y >> 2)); composer.addPass(streak); }
+  composer.addPass(new OutputPass());
+  if (Q.fxaa) { const fx = new ShaderPass(FXAAShader); fx.uniforms.resolution.value.set(1 / size.x, 1 / size.y); composer.addPass(fx); }
+  finalPass = new ShaderPass(FinalShader); finalPass.uniforms.res.value.set(size.x, size.y); composer.addPass(finalPass); applyGrade();
   camera.aspect = w / h; camera.fov = w < h ? 82 : 68; camera.updateProjectionMatrix();
-  holo.mat.uniforms.vh.value = size.y; pod.mat.uniforms.vh.value = size.y;
-  keyLight.shadow.mapSize.setScalar(quality === 'high' ? 1024 : 512);
+  holo.mat.uniforms.vh.value = size.y; pod.mat.uniforms.vh.value = size.y; pod.steam.uniforms.vh.value = size.y;
+  winLight.castShadow = !!Q.winShadow; if (winLight.shadow.map) { winLight.shadow.map.dispose(); winLight.shadow.map = null; }
+  winLight.intensity = winLight.castShadow ? mood.cur.win : 60;
+  keyLight.shadow.mapSize.setScalar(quality === 'low' ? 512 : 1024);
   if (keyLight.shadow.map) { keyLight.shadow.map.dispose(); keyLight.shadow.map = null; }
   renderer.shadowMap.needsUpdate = true;
 }
@@ -687,7 +941,14 @@ async function build() {
   for (const i of [SIDE.WIN_A, SIDE.WIN_B, SIDE.WIN_C]) { const g = buildWindowSide(i); segLocal(g, -W / 2, 0, W / 2, 0); }
   const labels = { 1: [{ t: 'SECTOR 07', w: 600 }, { t: '居住リング 外周', s: .5, ls: .3 }], 5: [{ t: 'AIR 21.4%', w: 600 }, { t: '循環 正常', s: .5, ls: .3 }], 7: null, 10: [{ t: 'HYGIENE', w: 600 }, { t: '洗浄ポッド', s: .5, ls: .3 }], 11: [{ t: 'K-12', w: 600 }, { t: 'PRIVATE MODULE', s: .5 }] };
   for (const i of [1, 5, 7, 10, 11]) { const g = buildPlainSide(i, labels[i]); segLocal(g, -W / 2, 0, W / 2, 0); }
-  buildPod(); buildLounge(); buildDust();
+  buildPod(); buildLounge(); buildDust(); buildBlobs(); buildShafts();
+  M.glass.envMap = M.glassDS.envMap = cubeRT.texture;
+  scene.traverse(o => { if (o.isMesh && o.material) boxify(o.material); });
+  // AO の計算（法線と深度の撮影）から外す物：半透明（ガラス、置き影、文字、画面、光の柱）、シェーダで描く物（窓の外）、
+  // 粒（ホログラム、埃、シャワー、航行灯）、ワイヤーフレーム、細い部品（2番目に大きい辺が 3.5cm 未満）
+  scene.updateMatrixWorld(true);
+  scene.traverse(o => { const m = o.material; if (o.isPoints || (o.isMesh && m && (m.transparent || m.alphaTest > 0 || m.isShaderMaterial || m.wireframe))) { noAO.push(o); return; }
+    if (o.isMesh) { o.geometry.computeBoundingBox(); const d = o.geometry.boundingBox.getSize(new THREE.Vector3()).multiply(o.scale).toArray().sort((p, q) => p - q); if (d[1] < .035) noAO.push(o); } });
 
   interactables.push({ pos: term.pos, r: 1.5, label: () => `照明を切り替える ― ${MOODS[(mood.target + 1) % MOODS.length].jp}`, act: () => { setMood((mood.target + 1) % MOODS.length); audio.mood(mood.target); toast('LIGHTING : ' + MOODS[mood.target].name); } });
   const HN = ['PLANET', 'TERRAIN', 'GALAXY', 'OFF'];
@@ -703,7 +964,7 @@ async function build() {
 let last = 0, termTimer = 0, fpsAcc = 0, fpsN = 0;
 function tick(now) {
   requestAnimationFrame(tick);
-  const dt = Math.min((now - last) / 1000, .05); last = now; time += dt;
+  const raw = (now - last) / 1000, dt = Math.min(raw, .05); last = now; time += dt; if (!document.hidden && !cfgOver) autoScale(now);
   if (state === 'menu') { player.yaw = Math.PI + Math.sin(time * .16) * .32; player.pitch = -.03 + Math.sin(time * .11) * .03; }
   updatePlayer(dt); updateMood(dt); updateFocus();
   // 扉
@@ -721,6 +982,9 @@ function tick(now) {
   holo.mat.uniforms.time.value = time; holo.mat.uniforms.power.value = holo.power * flick;
   holo.beam.material.opacity = .1 * holo.power * flick; holo.beam.visible = holo.power > .02; holo.light.intensity = 2.2 * holo.power * flick;
   pod.power += ((pod.on ? 1 : 0) - pod.power) * (1 - Math.exp(-dt * 2.2)); pod.mat.uniforms.power.value = pod.power; pod.mat.uniforms.time.value = time; pod.light.intensity = 4.5 + pod.power * 3;
+  pod.fog += ((pod.on ? 1 : 0) - pod.fog) * (1 - Math.exp(-dt * (pod.on ? .5 : .12)));          // 曇りはゆっくり付き、もっとゆっくり晴れる
+  pod.steam.uniforms.power.value = Math.max(pod.power, pod.fog * .6); pod.steam.uniforms.time.value = time; pod.fogMat.opacity = pod.fog * .42;
+  shaftMat.uniforms.time.value = time;
   audio.listener(camera.position.x, camera.position.y, camera.position.z, player.yaw);
   for (const s of spinners) { s.rotation.y = time * .5; s.rotation.x = time * .23; }
   for (const m of term.mats) m.opacity = .92 + .08 * Math.sin(time * 40 + m.id);
@@ -729,8 +993,9 @@ function tick(now) {
   skyMat.uniforms.time.value = time; finalPass.uniforms.time.value = time % 100;
   if (navLights) navLights.material.opacity = 1;
   if (toastTimer > 0) { toastTimer -= dt; if (toastTimer <= 0) $('toast').classList.remove('on'); }
-  composer.render(dt);
-  if (DEBUG) { fpsAcc += dt; fpsN++; if (fpsAcc > .5) { $('dbg').textContent = `${(fpsN / fpsAcc).toFixed(0)} fps  x ${player.x.toFixed(2)} z ${player.z.toFixed(2)}  yaw ${player.yaw.toFixed(2)}  ${quality}  calls ${renderer.info.render.calls}`; fpsAcc = fpsN = 0; } }
+  renderer.info.reset(); composer.render(dt);
+  // fps は、上限を付ける前の実時間で数える
+  if (DEBUG) { fpsAcc += raw; fpsN++; if (fpsAcc > .5) { $('dbg').textContent = `${(fpsN / fpsAcc).toFixed(0)} fps  x ${player.x.toFixed(2)} z ${player.z.toFixed(2)}  yaw ${player.yaw.toFixed(2)}  ${quality} ${bufSize.x}x${bufSize.y} x${auto.scale.toFixed(2)} ao ${gtao ? 'on' : 'off'}  calls ${renderer.info.render.calls}  tris ${renderer.info.render.triangles}`; fpsAcc = fpsN = 0; } }
 }
 
 // ---------------------------------------------------------------- input / ui
@@ -739,9 +1004,23 @@ function start() { audio.init({ podP: new THREE.Vector3(pod.pos.x, 1.2, pod.pos.
   state = 'play'; $('menu').classList.add('hide'); $('hud').classList.add('on'); if (!start.once) { start.once = true; player.yaw = Math.PI; player.pitch = -.02; } lock(); canvas.focus(); }
 function pause() { state = 'menu'; keys.clear(); stick.x = stick.y = 0; stick.id = -1; lookT.id = -1; $('stick').style.display = 'none'; $('menu').classList.remove('hide'); $('hud').classList.remove('on'); $('startBtn').firstChild.textContent = 'RESUME'; $('startSub').textContent = '戻る'; if (document.pointerLockElement) document.exitPointerLock(); pause.yaw = player.yaw; }
 $('startBtn').addEventListener('click', start);
-$('qualBtn').addEventListener('click', () => { quality = quality === 'high' ? 'low' : 'high'; $('qualSub').textContent = quality === 'high' ? '高' : '軽量'; buildComposer(); });
-$('qualSub').textContent = quality === 'high' ? '高' : '軽量';
+$('qualBtn').addEventListener('click', () => { quality = { low: 'mid', mid: 'high', high: 'low' }[quality]; $('qualSub').textContent = QUAL[quality].jp; autoReset(); buildComposer(); });
+$('qualSub').textContent = QUAL[quality].jp;
+// 全画面（ブラウザや埋めこみ先が拒否することがある）
+const fsOn = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
+function toggleFs() {
+  const el = document.documentElement;
+  try { const p = fsOn() ? (document.exitFullscreen || document.webkitExitFullscreen).call(document) : (el.requestFullscreen || el.webkitRequestFullscreen).call(el); if (p && p.catch) p.catch(() => { $('fsSub').textContent = '使えません'; }); }
+  catch (e) { $('fsSub').textContent = '使えません'; }
+}
+$('fsBtn').addEventListener('click', toggleFs);
+for (const ev of ['fullscreenchange', 'webkitfullscreenchange']) document.addEventListener(ev, () => { $('fsSub').textContent = fsOn() ? '入' : '切'; });
 $('pauseBtn').addEventListener('click', pause);
+// 見た目の切り替え（色調、光の筋、横筋）
+const chip = (id, get, set) => { const el = $(id); const show = () => el.classList.toggle('on', get()); el.addEventListener('click', () => { set(!get()); show(); }); show(); };
+chip('gradeBtn', () => gradeOn, v => { gradeOn = v; applyGrade(); });
+chip('shaftBtn', () => shaftOn, v => { shaftOn = v; applyMood(); });
+chip('streakBtn', () => streakOn, v => { streakOn = v; buildComposer(); });
 $('sndBtn').addEventListener('click', () => { $('sndSub').textContent = audio.toggle() ? '入' : '切'; });
 // 音量つまみ（BGM / SE）。値はこのブラウザに覚えておく。
 for (const k of ['bgm', 'se']) {
@@ -753,6 +1032,7 @@ for (const k of ['bgm', 'se']) {
 $('actBtn').addEventListener('pointerdown', e => { e.stopPropagation(); interact(); });
 document.addEventListener('pointerlockchange', () => { const l = document.pointerLockElement === canvas; if (l) hadLock = true; else if (hadLock && state === 'play') pause(); });
 addEventListener('keydown', e => {
+  if (e.code === 'F3') { DEBUG = !DEBUG; if (!DEBUG) $('dbg').textContent = ''; e.preventDefault(); return; }
   if (e.code === 'Escape') { state === 'play' ? pause() : 0; return; }
   if (state !== 'play') return; keys.add(e.code);
   if (e.code === 'KeyE' || e.code === 'Enter') interact();
@@ -782,8 +1062,15 @@ canvas.addEventListener('contextmenu', e => e.preventDefault());
 window.ROOM = {
   pose(x, z, yaw, pitch = 0) { player.x = x; player.z = z; player.yaw = yaw; player.pitch = pitch; player.vx = player.vz = 0; state = 'play'; $('menu').classList.add('hide'); $('hud').classList.add('on'); },
   mood(i) { setMood(i, true); }, holo(i) { holo.form = i; holo.w.set(i === 0 ? 1 : 0, i === 1 ? 1 : 0, i === 2 ? 1 : 0); holo.power = i === 3 ? 0 : 1; },
-  door(v) { door.open = v; }, shower(v) { pod.on = v; pod.power = v ? 1 : 0; audio.shower(v); }, audio, quality(q) { quality = q; buildComposer(); },
-  get state() { return { x: player.x, z: player.z, yaw: player.yaw, door: door.open, mood: mood.target, holo: holo.form, pod: pod.on, audio: audio.ready, state, calls: renderer.info.render.calls, tris: renderer.info.render.triangles }; },
+  door(v) { door.open = v; }, shower(v) { pod.on = v; pod.power = pod.fog = v ? 1 : 0; audio.shower(v); }, audio,
+  env() { captureEnv(); captureEnv(); }, grade(v) { gradeOn = !!v; applyGrade(); }, shafts(v) { shaftOn = !!v; applyMood(); }, streak(v) { streakOn = !!v; buildComposer(); }, get box() { return [BOX_OK, BOXB_OK, boxOn, SPOT_OK, bloomGuard]; },
+  // 確認用：画面の1点に不正な値（NaN）を1フレームだけ置く（黒い四角に広がらないことを確かめる）
+  poison(on) { poisonMesh.visible = !!on; },
+  final(v) { finalPass.enabled = !!v; }, grain(v) { finalPass.uniforms.grain.value = v; }, ao(mode) { if (gtao) gtao.output = mode; return !!gtao; }, exposure(v) { renderer.toneMappingExposure = v; },
+  cfg(o) { cfgOver = o; autoReset(); buildComposer(); return { w: bufSize.x, h: bufSize.y, noAO: noAO.length }; },
+  bench(n = 20) { const gl = renderer.getContext(), px = new Uint8Array(4); const t = performance.now(); for (let i = 0; i < n; i++) { renderer.info.reset(); composer.render(.016); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); } return +((performance.now() - t) / n).toFixed(1); },
+  get dev() { return { auto, autoScale, bufSize, scene, renderer, composer, bloom, keyLight, hemi, winLight, bedLight, M, THREE, noAO, mood, MOODS, applyMood, pod, shaftMat, streak }; }, quality(q) { quality = q; autoReset(); buildComposer(); $('qualSub').textContent = QUAL[q].jp; },
+  get state() { return { x: player.x, z: player.z, yaw: player.yaw, door: door.open, mood: mood.target, holo: holo.form, pod: pod.on, audio: audio.ready, state, quality, buf: bufSize.x + 'x' + bufSize.y, scale: auto.scale, ao: !!gtao, dbg: $('dbg').textContent, calls: renderer.info.render.calls, tris: renderer.info.render.triangles }; },
   ready: false
 };
 build().then(() => { window.ROOM.ready = true; }).catch(e => { console.error(e); $('startSub').textContent = '起動に失敗しました'; });

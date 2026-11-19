@@ -37,6 +37,14 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .btn:hover,.btn:focus-visible{background:rgba(127,227,255,.1);border-color:var(--cy);outline:none}
 .btn:hover::before,.btn:focus-visible::before{opacity:1}
 .btn.main{border-color:rgba(127,227,255,.55)}
+.chips{display:flex;gap:8px}
+.chip{flex:1;min-width:0;padding:8px 4px 7px;font-size:12px;font-weight:600;letter-spacing:.16em;text-align:center;color:var(--dim);
+  border:1px solid rgba(233,238,242,.18);background:rgba(10,14,18,.45);transition:background .2s,border-color .2s,color .2s}
+.chip small{display:block;font-family:"Zen Kaku Gothic New",sans-serif;font-weight:400;font-size:10px;letter-spacing:.1em;margin-top:2px;opacity:.75}
+.chip::after{content:"";display:block;height:2px;margin:5px 22% 0;background:rgba(233,238,242,.15)}
+.chip.on{color:var(--ink);border-color:rgba(127,227,255,.6);background:rgba(127,227,255,.12)}
+.chip.on::after{background:var(--cy)}
+.chip:hover,.chip:focus-visible{border-color:var(--cy);outline:none}
 .vol{display:flex;align-items:center;gap:14px;padding:6px 4px 2px 22px;font-size:15px;font-weight:500;letter-spacing:.3em}
 .vol span{width:46px}
 .vol output{width:46px;text-align:right;font-size:13px;letter-spacing:.1em;color:var(--dim)}
@@ -102,14 +110,16 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
     <div class="sub">個室区画 ― 主観視点プロトタイプ</div>
     <div class="btns">
       <button class="btn main" id="startBtn">ENTER<small id="startSub">入室する</small></button>
-      <button class="btn" id="qualBtn">QUALITY<small id="qualSub">高</small></button>
+      <button class="btn" id="qualBtn">QUALITY<small id="qualSub">標準</small></button>
+      <button class="btn" id="fsBtn">FULLSCREEN<small id="fsSub">切</small></button>
+      <div class="chips"><button class="chip" id="gradeBtn">GRADE<small>色調</small></button><button class="chip" id="shaftBtn">SHAFT<small>光の筋</small></button><button class="chip" id="streakBtn">STREAK<small>横筋</small></button></div>
       <button class="btn" id="sndBtn">SOUND<small id="sndSub">入</small></button>
       <label class="vol"><span>BGM</span><input type="range" id="bgmVol" min="0" max="100" step="5" aria-label="BGMの音量"><output id="bgmVal"></output></label>
       <label class="vol"><span>SE</span><input type="range" id="seVol" min="0" max="100" step="5" aria-label="効果音の音量"><output id="seVal"></output></label>
     </div>
     <div class="help only-mouse">
       <div><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>移動　<kbd>SHIFT</kbd>早歩き</div>
-      <div><kbd>MOUSE</kbd>視点　<kbd>E</kbd>操作　<kbd>ESC</kbd>メニュー</div>
+      <div><kbd>MOUSE</kbd>視点　<kbd>E</kbd>操作　<kbd>ESC</kbd>メニュー　<kbd>F3</kbd>fps</div>
       <div>音が出ます（ENTER で開始）</div>
     </div>
     <div class="help only-touch">
